@@ -1,37 +1,56 @@
 import math
 import torch
+import torch.nn as nn
 import cuda.tile as ct
 
 @ct.kernel
 def img2patch(
     x: ct.Array, y: ct.Array, coord: ct.Array,
-    patch_size_x: ct.Constant, 
+    patch_size_x: ct.Constant,
     patch_size_y: ct.Constant
 ):
+    # x: [c, h, w], y: [n, c * patch_size_x * patch_size_y]
+    block_x, block_y, block_z = ct.bid(0), ct.bid(1), ct.bid(2)
+    num_block_y, num_channel = ct.num_blocks(1), x.shape[0]
+    
+    tile_x = ct.load(
+        x, (block_z, block_x, block_y), (1, patch_size_x, patch_size_y), 
+        padding_mode=ct.PaddingMode.ZERO
+    )
+    tile_x = ct.reshape(tile_x, shape=(1, patch_size_x * patch_size_y))
+    ct.store(y, (block_x * num_block_y + block_y, block_z), tile_x)
+    if block_z == 0:
+        local_coord_x = ct.full(shape=(1, 1), fill_value=(block_x), dtype=ct.int32)
+        local_coord_y = ct.full(shape=(1, 1), fill_value=(block_y), dtype=ct.int32)
+        ct.store(
+            coord, (block_x * num_block_y + block_y , 0), 
+            ct.cat((local_coord_x, local_coord_y), axis=1)
+        )
+        
+@ct.kernel
+def patch2img(
+    x: ct.Array, y: ct.Array,
+    patch_size_x: ct.Constant,
+    patch_size_y: ct.Constant
+):
+    # x: [n, patch_size_x * patch_size_y * c], y: [c, h, w]
     block_x, block_y, block_z = ct.bid(0), ct.bid(1), ct.bid(2)
     num_block_y = ct.num_blocks(1)
-    
-    tile = ct.load(x, (block_z, block_x, block_y), (1, patch_size_x, patch_size_y), padding_mode=ct.PaddingMode.ZERO)
-    tile = ct.reshape(tile, shape=(1, patch_size_x * patch_size_y))
-    
-    ct.store(y, (block_x * block_y, 0), tile)
-    
-    local_coord_x = ct.full(shape=(1, 1), fill_value=(block_x), dtype=ct.int32)
-    local_coord_y = ct.full(shape=(1, 1), fill_value=(block_y), dtype=ct.int32)
-    ct.store(coord, (block_x + block_y * num_block_y, 0), ct.cat((local_coord_x, local_coord_y), axis=1))
 
-n, c, h, w = 1, 3, 31, 31
-patch_size_x: int = 32
-patch_size_y: int = 32
-num_patch_x: int = ct.cdiv(w, patch_size_x)
-num_patch_y: int = ct.cdiv(h, patch_size_y)
-x = torch.rand(size=(c, h, w), device="cuda", dtype=torch.float)
-y = torch.empty(size=(num_patch_x * num_patch_y, patch_size_x * patch_size_y * c), device="cuda", dtype=torch.float)
-coord = torch.empty(size=(num_patch_x * num_patch_y, 2), dtype=torch.int32, device="cuda")
-grid = (num_patch_x, num_patch_y, c)
+    tile_x = ct.load(x, (block_x * num_block_y + block_y, block_z), (1, patch_size_x * patch_size_y),)
+    tile_x = ct.reshape(tile_x, (1, patch_size_x, patch_size_y))
+    ct.store(y, (block_z, block_x, block_y), tile_x)
 
-ct.launch(
-    torch.cuda.current_stream(), grid, img2patch, 
-    (x, y, coord, patch_size_x, patch_size_y)
-)
-print(y)
+
+C, H, W = 2, 8, 8
+patch_size_h, patch_size_w = 4, 4
+num_patch_h, num_patch_w = ct.cdiv(H, patch_size_h), ct.cdiv(W, patch_size_w)
+x = torch.rand(size=[C, H, W], device="cuda")
+y = torch.empty(size=[num_patch_h * num_patch_w, patch_size_h * patch_size_w * C], device="cuda")
+z = torch.empty(size=[C, H, W], device="cuda")
+coord = torch.empty(size=[num_patch_h*num_patch_w, 2], device="cuda", dtype=torch.int32)
+ct.launch(torch.cuda.current_stream(), (num_patch_h, num_patch_w, C), img2patch, (x, y, coord, patch_size_h, patch_size_w))
+ct.launch(torch.cuda.current_stream(), (num_patch_h, num_patch_w, C), patch2img, (y, z, patch_size_h, patch_size_w))
+
+# expect to be all zero
+print(x - z)
