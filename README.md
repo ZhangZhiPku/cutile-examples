@@ -1,11 +1,9 @@
 # cutile-examples
 
 这是一个基于 **cutile** 的 GPU 算子示例仓库。我会不定期往这里添加新的算子实现。  
-任何人可以在任何地点、任何时间自由使用这些算子代码。
 
 This repository contains example GPU kernels implemented with **cutile**.  
-I will continuously add new kernels from time to time.  
-Everyone is free to use these kernels anywhere, anytime.
+I will continuously add new kernels from time to time.
 
 ---
 
@@ -63,6 +61,11 @@ Everyone is free to use these kernels anywhere, anytime.
     SiLU 激活函数（又称 Swish）及其与输入的融合乘法算子。  
     SiLU (a.k.a. Swish) activation and its fused multiply operator.
 
+14. **MSE Loss Function**  
+    Mse 损失函数与其梯度传播
+
+15. **Fused AdamW**  
+    AdamW 优化器
 ---
 
 ## 使用方式 / How to Use
