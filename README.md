@@ -67,7 +67,7 @@ I will continuously add new kernels from time to time.
 15. **Fused AdamW**  
     AdamW 优化器的融合实现，包含了更新 w, m, v 的操作
 
-16. **Fused Muon **  
+16. **Fused Muon**  
     Muon 优化器 Newton-Schulz 迭代的高性能实现，包含了针对对称矩阵的特殊矩阵乘法
 ---
 
