@@ -65,7 +65,10 @@ I will continuously add new kernels from time to time.
     Mse 损失函数与其梯度传播
 
 15. **Fused AdamW**  
-    AdamW 优化器
+    AdamW 优化器的融合实现，包含了更新 w, m, v 的操作
+
+16. **Fused Muon **  
+    Muon 优化器 Newton-Schulz 迭代的高性能实现，包含了针对对称矩阵的特殊矩阵乘法
 ---
 
 ## 使用方式 / How to Use
