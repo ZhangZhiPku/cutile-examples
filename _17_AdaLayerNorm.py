@@ -35,56 +35,6 @@ def layernorm(
 
 
 @ct.kernel
-def _AdaLayerNormImg(
-    x: ct.Array, w: ct.Array, b: ct.Array,
-    selector: ct.Array, shift: ct.Array, scale: ct.Array, eps: float,
-    o: ct.Array, normalize_dim: int, allow_tma: ct.Constant, tile_size: ct.Constant
-):
-    """
-    ### Brief:
-    一个定制化版本的 AdaLayerNorm, 为了 QwenVideo Image to Video 服务
-    相比普通版本的 AdaLayerNorm，它多了一个 selector 用来选择 shift 和 scale
-
-    ### FORMULA:
-    x = layernorm(x, w, b)
-
-    o = modulate(x, shift, scale, selector)
-    return o
-    
-    ### WHERE:
-    x, o: [batch, seqlen, dim]
-    w, b: [dim]
-    selector: [batch, seqlen]
-    scale, shift: [batch * 2, dim]
-    
-    ### BLOCK MAPPING:
-    3d grid, mapping on o:
-    [batch(block_z 1:1), seqlen(block_y 1:1), dim(block_x 1:tile_size)]
-    """
-    block_x, block_y, block_z = ct.bid(2), ct.bid(1), ct.bid(0)
-
-    tile_x = ct.load(x, (block_z, block_y, block_x), (1, 1, tile_size), allow_tma=allow_tma, padding_mode=ct.PaddingMode.ZERO)
-    tile_x = tile_x.reshape((tile_size, ))
-    tile_w = ct.load(w, (block_x, ), (tile_size, ), allow_tma=False)
-    tile_b = ct.load(b, (block_x, ), (tile_size, ), allow_tma=False, padding_mode=ct.PaddingMode.ZERO)
-
-    tile_x = layernorm(tile_x, tile_w, tile_b, tile_size, normalize_dim, eps)
-    _selector = ct.load(selector, (block_z, block_y), (1, 1), allow_tma=False).item()
-    
-    if (_selector == 1):
-        tile_shift = ct.load(shift, (block_z * 2, block_x), (1, tile_size), allow_tma=False)
-        tile_scale = ct.load(scale, (block_z * 2, block_x), (1, tile_size), allow_tma=False)
-    else:
-        tile_shift = ct.load(shift, (block_z * 2 + 1, block_x), (1, tile_size), allow_tma=False)
-        tile_scale = ct.load(scale, (block_z * 2 + 1, block_x), (1, tile_size), allow_tma=False)
-
-    tile_shift = tile_shift.reshape((tile_size, ))
-    tile_scale = tile_scale.reshape((tile_size, ))
-    tile_x = modulate(tile_x, tile_shift, tile_scale)
-    tile_x = tile_x.reshape((1, 1, tile_size))
-    ct.store(o, (block_z, block_y, block_x), tile_x.astype(o.dtype), allow_tma=allow_tma)
-
-@ct.kernel
 def _AdaLayerNorm(
     x: ct.Array, w: ct.Array, b: ct.Array,
     shift: ct.Array, scale: ct.Array, eps: float,
