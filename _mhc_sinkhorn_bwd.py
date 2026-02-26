@@ -13,16 +13,18 @@ tilesize = 32
 
 
 @ct.function(host=False, tile=True)
-def matvec_A(R, x, n_stream: ct.Constant[int]):
+def matvec_S(R, x):
     """
+    Compute S @ x = (I - R^T R) x = x - R^T (R x)
+    without materializing R^T R.
+
     R: (tilesize, n_stream, n_stream)
-    x: (tilesize, n_stream*2, 1)
+    x: (tilesize, n_stream, 1)
+    returns: (tilesize, n_stream, 1)
     """
-    x1 = ct.extract(x, index=(0, 0, 0), shape=(tilesize, n_stream, 1))
-    x2 = ct.extract(x, index=(0, 1, 0), shape=(tilesize, n_stream, 1))
-    ax1 = x1 + ct.matmul(R, x2)
-    ax2 = ct.matmul(R.transpose(-2, -1), x1) + x2
-    return ct.cat((ax1, ax2), axis=-2)  # (tilesize, n_stream*2, 1)
+    Rx = ct.matmul(R, x)  # q = R x, (tilesize, n_stream, 1)
+    RTRx = ct.matmul(R.transpose(-2, -1), Rx)  # R^T q, (tilesize, n_stream, 1)
+    return x - RTRx
 
 
 @ct.function(host=False, tile=True)
@@ -31,7 +33,7 @@ def dot(a, b):  # a/b: (..., dim, 1)
 
 
 @ct.kernel
-def sinkhorn_knopp_bwd_implicit_cg(
+def sinkhorn_knopp_bwd_implicit_cg_opt1(
     out,
     dout,
     res,
@@ -46,7 +48,7 @@ def sinkhorn_knopp_bwd_implicit_cg(
     </typecheck>
 
     Side note:
-    1. Number of CG iterations is typically num_streams*2.
+    1. Number of CG iterations is typically num_streams.
         This is derived from the theoretical properties of CG method.
     2. Matrix R is theoretically singular (not full-rank) and numerically near-singular,
         so the solution of x_sol can be very different from the real solution x_real.
@@ -69,45 +71,39 @@ def sinkhorn_knopp_bwd_implicit_cg(
     )
 
     RdR = R * dR
-    # row sum
-    b1 = ct.sum(RdR, axis=-1).reshape((tilesize, n_stream, 1))
-    # col sum
-    b2 = ct.sum(RdR, axis=-2).reshape((tilesize, n_stream, 1))
+    # r_vec = (G⊙R) 1  (row sums),  shape (tilesize, n_stream, 1)
+    r_vec = ct.sum(RdR, axis=-1).reshape((tilesize, n_stream, 1))
+    # c_vec = (G⊙R)^T 1  (col sums), shape (tilesize, n_stream, 1)
+    c_vec = ct.sum(RdR, axis=-2).reshape((tilesize, n_stream, 1))
 
-    b = ct.cat((b1, b2), axis=-2)
+    # b = c_vec - R^T r_vec
+    b = c_vec - ct.matmul(R.transpose(-2, -1), r_vec)
 
-    # Solve: Ax=b =========================================
-    R = R.reshape((tilesize, n_stream, n_stream))
-    # Conjugate Gradients: init
-    x = ct.zeros((tilesize, n_stream * 2, 1), dtype=ct.float32)
-    r = b - matvec_A(R, x, n_stream=n_stream)
+    # Solve: (I - R^T R) x = b  via CG ========================
+    x = ct.zeros((tilesize, n_stream, 1), dtype=ct.float32)
+    r = b - matvec_S(R, x)
     p = r
     r_normsq = dot(r, r)
 
-    # Conjugate Gradients: iter
-    num_iter_cg = n_stream * 2
-    for _ in range(num_iter_cg):
-        Ap = matvec_A(R, p, n_stream=n_stream)
-        pAp = dot(p, Ap)
-        # VERY important to avoid divide by zero
-        alpha = r_normsq / (pAp + EPS)
+    # n iterations suffice for an n×n system
+    for _ in range(n_stream):
+        Sp = matvec_S(R, p)
+        pSp = dot(p, Sp)
+        alpha = r_normsq / (pSp + EPS)
         x += alpha * p
-        r -= alpha * Ap
+        r -= alpha * Sp
         r_new_normsq = dot(r, r)
-        # not very important to avoid divide by zero, but it's good to have it
         beta = r_new_normsq / (r_normsq + EPS)
         p = r + beta * p
         r_normsq = r_new_normsq
-    # End solve: Ax=b =========================================
+    # End solve ================================================
 
-    x1 = ct.extract(x, index=(0, 0, 0), shape=(tilesize, n_stream, 1))
-    x2 = ct.extract(x, index=(0, 1, 0), shape=(tilesize, n_stream, 1))
+    # u = r_vec - R x,  v = x
+    u = r_vec - ct.matmul(R, x)  # (tilesize, n_stream, 1)
+    v = x  # (tilesize, n_stream, 1)
 
-    x1_expanded = x1.reshape((tilesize, n_stream, 1))
-    x2_expanded = x2.reshape((tilesize, 1, n_stream))
-
-    res_tile = dR - x1_expanded - x2_expanded
-    res_tile = res_tile * R
+    # res = (dR - u_i - v_j) * R
+    res_tile = (dR - u.reshape((tilesize, n_stream, 1)) - v.reshape((tilesize, 1, n_stream))) * R
 
     ct.store(
         res,
@@ -157,17 +153,16 @@ loss_a.backward()
 grad_M_autograd = M.grad.detach().clone()
 
 ######################################################################
-# Method B: Implicit differentiation
+# Method B: Implicit differentiation opt1 (n×n implicit matvec_S)
 ######################################################################
 grad_R = loss_weight
 grad_M_implicit = torch.empty_like(R)
 ct.launch(
     torch.cuda.current_stream(0),
     (seqlen // tilesize,),
-    sinkhorn_knopp_bwd_implicit_cg,
+    sinkhorn_knopp_bwd_implicit_cg_opt1,
     [R, grad_R, grad_M_implicit, n_stream],
 )
-
 
 ######################################################################
 # Compare
@@ -181,20 +176,10 @@ rel_diff = abs_diff / (g1.abs() + 1e-12)
 print("Comparison of gradients dL/dM")
 print("--------------------------------")
 
-
-def format_list(ls):
-    return [f"{x:.2e}" for x in ls]
-
-
 MAE = abs_diff.mean(dim=(-1, -2)).tolist()
 max_abs_diff = abs_diff.reshape(seqlen, -1).max(-1).values.tolist()
 mean_rel_diff = rel_diff.mean(dim=(-1, -2)).tolist()
 max_rel_diff = rel_diff.reshape(seqlen, -1).max(-1).values.tolist()
-
-# print(f"MAE: {format_list(MAE)}")
-# print(f"max_abs_diff: {format_list(max_abs_diff)}")
-# print(f"mean_rel_diff: {format_list(mean_rel_diff)}")
-# print(f"max_rel_diff: {format_list(max_rel_diff)}")
 
 print(f"Max MAE = {max(MAE)}")
 print(f"Max max_abs_diff = {max(max_abs_diff)}")
