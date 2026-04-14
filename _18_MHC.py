@@ -89,17 +89,33 @@ def Split_H_Kernel(
     beta_post = ct.extract(raw, (Stream * Stream + Stream,), (Stream, )).reshape((1, Stream))
     
     # n_chunks = H.shape[0]
-    acc_H = ct.full((1, tileM, tileN), 0.0, dtype=ct.float32)
+    H_pre_tile = ct.full((1, tileM, Stream), 0.0, dtype=ct.float32)
+    H_res_tile = ct.full((1, tileM, Stream * Stream), 0.0, dtype=ct.float32)
+    H_post_tile = ct.full((1, tileM, Stream), 0.0, dtype=ct.float32)
+    rms_tile = ct.full((1, tileM, 1), 0.0, dtype=ct.float32)
+
+    offset_m = block_m * tileM + ct.arange(tileM, dtype=ct.int32)
+    offset_m = offset_m.reshape((1, tileM, 1))
+
+    offset_n_pre = ct.arange(Stream, dtype=ct.int32).reshape((1, 1, Stream))
+    offset_n_res = Stream + ct.arange(Stream * Stream, dtype=ct.int32).reshape((1, 1, Stream * Stream))
+    offset_n_post = Stream + Stream * Stream + ct.arange(Stream, dtype=ct.int32).reshape((1, 1, Stream))
+    offset_n_rms = Stream * Stream + 2 * Stream + ct.arange(1, dtype=ct.int32).reshape((1, 1, 1))
     for i in range(NCHUNKS):
-        H_tile = ct.load(H, (i, block_m, 0), (1, tileM, tileN))
-        acc_H += H_tile
-    acc_H = acc_H.reshape((tileM, tileN))
+        H_pre_tile += ct.gather(H, (i, offset_m, offset_n_pre))
+        H_res_tile += ct.gather(H, (i, offset_m, offset_n_res))
+        H_post_tile += ct.gather(H, (i, offset_m, offset_n_post))
+        rms_tile += ct.gather(H, (i, offset_m, offset_n_rms))
     
-    H_pre_tile =  ct.extract(acc_H, (0, 0), (tileM, Stream))
-    H_res_tile = ct.extract(acc_H, (0, Stream), (tileM, Stream * Stream)).reshape((tileM, Stream, Stream))
-    H_post_tile = ct.extract(acc_H, (0, Stream * Stream + Stream), (tileM, Stream))
-    
-    rms_norm_tile = ct.rsqrt(ct.extract(acc_H, (0, Stream * Stream + 2 * Stream), (tileM, 1)) / K + 1e-9)
+    # 这里用extract有问题，猜测是编译器重新排布了排列顺序
+    # H_pre_tile =  ct.extract(acc_H, (0, 0), (tileM, Stream))
+    # H_res_tile = ct.extract(acc_H, (0, Stream), (tileM, Stream * Stream)).reshape((tileM, Stream, Stream))
+    # H_post_tile = ct.extract(acc_H, (0, Stream * Stream + Stream), (tileM, Stream))
+    H_pre_tile = H_pre_tile.reshape((tileM ,Stream))
+    H_res_tile = H_res_tile.reshape((tileM, Stream, Stream))
+    H_post_tile = H_post_tile.reshape((tileM, Stream))
+    rms_tile = rms_tile.reshape((tileM, 1))
+    rms_norm_tile = ct.rsqrt(rms_tile / K + 1e-9)
     
     H_pre_tile =  sigmoid_exp2(INV_LOG_2 * (rms_norm_tile * alpha_pre * H_pre_tile + beta_pre))
     # We save the log of H_res, and apply sinkhorn in another kernel to avoid numerical instability
